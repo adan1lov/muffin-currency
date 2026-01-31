@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 	"log/slog"
 	"net/http"
 	"os"
@@ -111,9 +114,17 @@ func initTracing(serviceName, zipkinURL string) error {
 func tracingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Start a new span for this request
-		span := tracer.StartSpan(r.URL.Path, 
+
+		spanContext, err := ParseTraceparent(r.Header.Get("traceparent"))
+		if err != nil {
+			slog.Warn("Failed to parse traceparent", "error", err, "traceparent", r.Header.Get("traceparent"))
+			spanContext = model.SpanContext{} // Создаем новый контекст
+		}
+
+		span := tracer.StartSpan(r.URL.Path,
 			zipkin.Kind(model.Server),
 			zipkin.RemoteEndpoint(nil),
+			zipkin.Parent(spanContext),
 		)
 		defer span.Finish()
 		
@@ -422,4 +433,48 @@ func main() {
 		logger.Error("Server failed to start", "error", err)
 		os.Exit(1)
 	}
+}
+
+func ParseTraceparent(tp string) (model.SpanContext, error) {
+	// Формат: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+	if tp == "" {
+		return model.SpanContext{}, nil // Нет заголовка - создаем новый trace
+	}
+	
+	parts := strings.Split(tp, "-")
+	if len(parts) < 4 {
+		return model.SpanContext{}, fmt.Errorf("invalid traceparent format: %s", tp)
+	}
+
+	// 1. Парсим TraceID (16 байт / 32 символа)
+	tIDBytes, err := hex.DecodeString(parts[1])
+	if err != nil || len(tIDBytes) != 16 {
+		return model.SpanContext{}, fmt.Errorf("invalid traceid: %s, error: %v", parts[1], err)
+	}
+
+	traceID := model.TraceID{
+		High: binary.BigEndian.Uint64(tIDBytes[:8]),
+		Low:  binary.BigEndian.Uint64(tIDBytes[8:]),
+	}
+
+	// 2. Парсим SpanID (8 байт / 16 символов)
+	sIDBytes, err := hex.DecodeString(parts[2])
+	if err != nil || len(sIDBytes) != 8 {
+		return model.SpanContext{}, fmt.Errorf("invalid spanid: %s, error: %v", parts[2], err)
+	}
+	spanID := model.ID(binary.BigEndian.Uint64(sIDBytes))
+
+	// 3. Парсим флаги (последний байт)
+	flagsBytes, err := hex.DecodeString(parts[3])
+	sampled := false
+	if err == nil && len(flagsBytes) > 0 {
+		// Бит 0 отвечает за сэмплирование
+		sampled = (flagsBytes[0] & 0x01) == 0x01
+	}
+
+	return model.SpanContext{
+		TraceID: traceID,
+		ID:      spanID,
+		Sampled: &sampled,
+	}, nil
 }
