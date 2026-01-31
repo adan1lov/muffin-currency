@@ -1,4 +1,4 @@
-module your-module-name
+module muffin-currency
 
 go 1.21
 
