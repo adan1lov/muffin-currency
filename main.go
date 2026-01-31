@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -341,13 +342,22 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	// Настройка structured logging
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	logFile, err := os.OpenFile("logs/app.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		slog.Error("Failed to open log file", "error", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+	
+	// Создаем multi-writer для логирования в файл и stdout
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	logger := slog.New(slog.NewJSONHandler(multiWriter, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 	
 	// Инициализируем Zipkin tracing
-	err := initTracing("currency-service", "http://localhost:9411/api/v2/spans")
+	err = initTracing("muffin-currency", "http://localhost:9411/api/v2/spans")
 	if err != nil {
 		slog.Error("Failed to initialize Zipkin tracing", "error", err)
 		os.Exit(1)
@@ -399,7 +409,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		
-		if err := server.Shutdown(ctx); err != nil {
+		if err = server.Shutdown(ctx); err != nil {
 			logger.Error("Server forced to shutdown", "error", err)
 		}
 	}()
@@ -408,7 +418,7 @@ func main() {
 		"port", port,
 		"zipkin_endpoint", "http://localhost:9411/api/v2/spans")
 	
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+	if err = server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("Server failed to start", "error", err)
 		os.Exit(1)
 	}

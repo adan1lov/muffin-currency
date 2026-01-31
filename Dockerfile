@@ -6,7 +6,9 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /muffin-currency
 
-FROM alpine:latest
+FROM alpine:3.23.3
+
+RUN mkdir -p /logs
 
 COPY --from=builder /muffin-currency /muffin-currency
 EXPOSE 8080
