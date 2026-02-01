@@ -43,7 +43,7 @@ var (
 			Name: "muffin_currency_requests_total",
 			Help: "Total number of HTTP requests",
 		},
-		[]string{"method", "path", "status", "trace_id"},
+		[]string{"method", "path", "status"},
 	)
 
 	httpRequestDuration = promauto.NewHistogramVec(
@@ -52,7 +52,7 @@ var (
 			Help:    "HTTP request duration",
 			Buckets: prometheus.DefBuckets,
 		},
-		[]string{"method", "path", "trace_id"},
+		[]string{"method", "path"},
 	)
 
 	currencyRateGauge = promauto.NewGaugeVec(
@@ -60,7 +60,7 @@ var (
 			Name: "muffin_currency_rate",
 			Help: "Current currency exchange rate",
 		},
-		[]string{"from", "to", "trace_id"},
+		[]string{"from", "to"},
 	)
 
 	// Health метрика
@@ -204,13 +204,11 @@ func metricsMiddleware(next http.Handler) http.Handler {
 			r.Method,
 			r.URL.Path,
 			fmt.Sprintf("%d", rw.statusCode),
-			traceID,
 		).Inc()
 		
 		httpRequestDuration.WithLabelValues(
 			r.Method,
 			r.URL.Path,
-			traceID,
 		).Observe(duration)
 	})
 }
@@ -286,7 +284,7 @@ func getRateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Export to Prometheus with trace ID
-	currencyRateGauge.WithLabelValues(from, to, traceID).Set(rate)
+	currencyRateGauge.WithLabelValues(from, to).Set(rate)
 	
 	response := CurrencyRate{
 		From: from,
