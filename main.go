@@ -2,477 +2,422 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
-	"encoding/binary"
 	"fmt"
-	"io"
-	"strings"
-	"log/slog"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	// Zipkin imports
-	"github.com/openzipkin/zipkin-go"
-	zipkinhttp "github.com/openzipkin/zipkin-go/reporter/http"
-	"github.com/openzipkin/zipkin-go/model"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-type CurrencyRate struct {
-	From string  `json:"from"`
-	To   string  `json:"to"`
-	Rate float64 `json:"rate"`
-}
-
-// Global variables for tracing
-var (
-	tracer *zipkin.Tracer
-)
-
-// Метрики Prometheus
-var (
-	httpRequestsTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "muffin_currency_requests_total",
-			Help: "Total number of HTTP requests",
-		},
-		[]string{"method", "path", "status"},
-	)
-
-	httpRequestDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "muffin_currency_request_duration_seconds",
-			Help:    "HTTP request duration",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"method", "path"},
-	)
-
-	currencyRateGauge = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "muffin_currency_rate",
-			Help: "Current currency exchange rate",
-		},
-		[]string{"from", "to"},
-	)
-
-	// Health метрика
-	healthStatus = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "muffin_currency_health",
-			Help: "Health status (1 = healthy)",
-		},
-	)
-)
-
-// Хранилище курсов
+// Курсы валют
 var rates = map[string]map[string]float64{
 	"CARAMEL":   {"CHOKOLATE": 0.85, "PLAIN": 75.50, "CARAMEL": 1},
 	"CHOKOLATE": {"CARAMEL": 1.18, "PLAIN": 89.00, "CHOKOLATE": 1},
 	"PLAIN":     {"CHOKOLATE": 0.013, "CARAMEL": 0.011, "PLAIN": 1},
 }
 
-// Initialize Zipkin tracing
-func initTracing(serviceName, zipkinURL string) error {
-	// Create a reporter to send traces to Zipkin
-	reporter := zipkinhttp.NewReporter(zipkinURL)
-	
-	// Create local endpoint
-	endpoint, err := zipkin.NewEndpoint(serviceName, "localhost:8080")
-	if err != nil {
-		return fmt.Errorf("failed to create zipkin endpoint: %w", err)
+// CurrencyRate - структура ответа
+type CurrencyRate struct {
+	From string  `json:"from"`
+	To   string  `json:"to"`
+	Rate float64 `json:"rate"`
+}
+
+// ErrorResponse - структура ошибки
+type ErrorResponse struct {
+	Error   string `json:"error"`
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// Глобальные переменные для телеметрии
+var (
+	tracer         trace.Tracer
+	meter          metric.Meter
+	requestCounter metric.Int64Counter
+	requestLatency metric.Float64Histogram
+)
+
+// Config - конфигурация приложения
+type Config struct {
+	ServiceName    string
+	ServiceVersion string
+	OTELEndpoint   string
+	HTTPPort       string
+}
+
+func getConfig() Config {
+	return Config{
+		ServiceName:    getEnv("SERVICE_NAME", "muffin-currency"),
+		ServiceVersion: getEnv("SERVICE_VERSION", "1.0.0"),
+		OTELEndpoint:   getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
+		HTTPPort:       getEnv("HTTP_PORT", "8080"),
 	}
-	
-	// Create the tracer
-	tracer, err = zipkin.NewTracer(
-		reporter,
-		zipkin.WithLocalEndpoint(endpoint),
-		zipkin.WithTraceID128Bit(true), // For compatibility with Spring Boot 3
-		zipkin.WithSharedSpans(false),
-		zipkin.WithSampler(zipkin.AlwaysSample),
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// initResource создает ресурс с информацией о сервисе
+func initResource(cfg Config) (*resource.Resource, error) {
+	return resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(cfg.ServiceName),
+			semconv.ServiceVersion(cfg.ServiceVersion),
+			attribute.String("environment", getEnv("ENVIRONMENT", "development")),
+		),
 	)
-	
+}
+
+// initTracerProvider инициализирует провайдер трейсинга
+func initTracerProvider(ctx context.Context, res *resource.Resource, cfg Config) (*sdktrace.TracerProvider, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, cfg.OTELEndpoint,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
 	if err != nil {
-		return fmt.Errorf("failed to create zipkin tracer: %w", err)
+		return nil, fmt.Errorf("failed to create gRPC connection: %w", err)
 	}
-	
-	slog.Info("Zipkin tracing initialized", 
-		"service", serviceName, 
-		"zipkin_url", zipkinURL)
-	
+
+	exporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trace exporter: %w", err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+
+	otel.SetTracerProvider(tp)
+
+	// Устанавливаем propagator для распространения контекста трейса
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return tp, nil
+}
+
+// initMeterProvider инициализирует провайдер метрик
+func initMeterProvider(ctx context.Context, res *resource.Resource, cfg Config) (*sdkmetric.MeterProvider, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, cfg.OTELEndpoint,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gRPC connection: %w", err)
+	}
+
+	exporter, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithGRPCConn(conn))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metric exporter: %w", err)
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(10*time.Second))),
+		sdkmetric.WithResource(res),
+	)
+
+	otel.SetMeterProvider(mp)
+	return mp, nil
+}
+
+// initMetrics инициализирует метрики
+func initMetrics(cfg Config) error {
+	meter = otel.Meter(cfg.ServiceName)
+
+	var err error
+
+	// Счетчик запросов
+	requestCounter, err = meter.Int64Counter(
+		"http_requests_total",
+		metric.WithDescription("Total number of HTTP requests"),
+		metric.WithUnit("{request}"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create request counter: %w", err)
+	}
+
+	// Гистограмма латентности
+	requestLatency, err = meter.Float64Histogram(
+		"http_request_duration_seconds",
+		metric.WithDescription("HTTP request latency in seconds"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create latency histogram: %w", err)
+	}
+
+	// Gauge для курсов валют
+	_, err = meter.Float64ObservableGauge(
+		"currency_rate",
+		metric.WithDescription("Current currency exchange rate"),
+		metric.WithFloat64Callback(func(ctx context.Context, observer metric.Float64Observer) error {
+			for from, toRates := range rates {
+				for to, rate := range toRates {
+					observer.Observe(rate,
+						metric.WithAttributes(
+							attribute.String("from", from),
+							attribute.String("to", to),
+						),
+					)
+				}
+			}
+			return nil
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create rate gauge: %w", err)
+	}
+
 	return nil
 }
 
-// Zipkin tracing middleware
-func tracingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Start a new span for this request
-
-		spanContext, err := ParseTraceparent(r.Header.Get("traceparent"))
-		if err != nil {
-			slog.Warn("Failed to parse traceparent", "error", err, "traceparent", r.Header.Get("traceparent"))
-			spanContext = model.SpanContext{} // Создаем новый контекст
-		}
-
-		span := tracer.StartSpan(r.URL.Path,
-			zipkin.Kind(model.Server),
-			zipkin.RemoteEndpoint(nil),
-			zipkin.Parent(spanContext),
-		)
-		defer span.Finish()
-		
-		// Add span to context
-		ctx := zipkin.NewContext(r.Context(), span)
-		
-		// Add HTTP tags to span
-		span.Tag("http.method", r.Method)
-		span.Tag("http.url", r.URL.String())
-		span.Tag("http.path", r.URL.Path)
-		span.Tag("component", "http")
-		
-		// Get trace ID for logging and metrics
-		traceID := span.Context().TraceID.String()
-		
-		// Add trace ID to response headers
-		w.Header().Set("X-Trace-ID", traceID)
-		
-		// Create custom response writer to capture status code
-		rw := &responseWriter{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-			traceID:        traceID,
-		}
-		
-		// Log request start with trace ID
-		slog.Info("Request started",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"trace_id", traceID,
-			"span_id", span.Context().ID.String(),
-		)
-		
-		// Call next handler
-		next.ServeHTTP(rw, r.WithContext(ctx))
-		
-		// Add status code to span
-		span.Tag("http.status_code", fmt.Sprintf("%d", rw.statusCode))
-		if rw.statusCode >= 400 {
-			span.Tag("error", "true")
-		}
-		
-		// Log request completion
-		slog.Info("Request completed",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", rw.statusCode,
-			"trace_id", traceID,
-		)
-	})
+// RateHandler обрабатывает запросы курсов валют
+type RateHandler struct {
+	tracer trace.Tracer
 }
 
-// Updated metrics middleware with tracing
-func metricsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		
-		// Get trace ID from context
-		var traceID string
-		if span := zipkin.SpanFromContext(r.Context()); span != nil {
-			traceID = span.Context().TraceID.String()
-		}
-		
-		// Wrap response writer
-		rw := &responseWriter{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-			traceID:        traceID,
-		}
-		
-		next.ServeHTTP(rw, r)
-		
-		duration := time.Since(start).Seconds()
-		
-		// Record metrics with trace ID
-		httpRequestsTotal.WithLabelValues(
-			r.Method,
-			r.URL.Path,
-			fmt.Sprintf("%d", rw.statusCode),
-		).Inc()
-		
-		httpRequestDuration.WithLabelValues(
-			r.Method,
-			r.URL.Path,
-		).Observe(duration)
-	})
+func NewRateHandler(tracer trace.Tracer) *RateHandler {
+	return &RateHandler{tracer: tracer}
 }
 
-// Extended response writer
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-	traceID    string
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-// Handler для /rate с трейсингом
-func getRateHandler(w http.ResponseWriter, r *http.Request) {
+func (h *RateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	span := zipkin.SpanFromContext(ctx)
-	var traceID string
-	
-	if span != nil {
-		traceID = span.Context().TraceID.String()
-		span.Tag("handler", "get_rate")
-		span.Tag("operation", "currency_conversion")
-	}
-	
+	start := time.Now()
+
+	// Получаем текущий span из контекста (создан otelhttp middleware)
+	span := trace.SpanFromContext(ctx)
+
+	// Получаем query параметры
 	from := r.URL.Query().Get("from")
 	to := r.URL.Query().Get("to")
-	
-	// Log with trace ID
-	slog.Info("Processing currency conversion",
-		"from", from,
-		"to", to,
-		"trace_id", traceID,
+
+	// Добавляем атрибуты к span
+	span.SetAttributes(
+		attribute.String("currency.from", from),
+		attribute.String("currency.to", to),
+		attribute.String("http.method", r.Method),
+		attribute.String("http.url", r.URL.String()),
 	)
-	
+
+	// Валидация параметров
 	if from == "" || to == "" {
-		slog.Error("Missing parameters", 
-			"from", from, 
-			"to", to,
-			"trace_id", traceID)
-		
-		if span != nil {
-			span.Tag("error", "missing_parameters")
-		}
-		
-		http.Error(w, `{"error": "Missing 'from' or 'to' parameter"}`, http.StatusBadRequest)
+		h.handleError(ctx, w, span, start, from, to, http.StatusBadRequest, "missing required parameters 'from' and 'to'")
 		return
 	}
-	
-	rate, exists := rates[from][to]
-	if !exists {
-		slog.Error("Currency pair not found",
-			"from", from,
-			"to", to,
-			"trace_id", traceID)
-		
-		if span != nil {
-			span.Tag("error", "pair_not_found")
-		}
-		
-		http.Error(w, `{"error": "Currency pair not found"}`, http.StatusNotFound)
+
+	// Создаем дочерний span для поиска курса
+	ctx, lookupSpan := h.tracer.Start(ctx, "lookup_rate",
+		trace.WithAttributes(
+			attribute.String("currency.from", from),
+			attribute.String("currency.to", to),
+		),
+	)
+
+	// Ищем курс
+	rate, found := h.lookupRate(from, to)
+	lookupSpan.End()
+
+	if !found {
+		h.handleError(ctx, w, span, start, from, to, http.StatusNotFound, fmt.Sprintf("rate not found for %s -> %s", from, to))
 		return
 	}
-	
-	// Add currency pair tags to span
-	if span != nil {
-		span.Tag("currency.from", from)
-		span.Tag("currency.to", to)
-		span.Tag("currency.rate", fmt.Sprintf("%f", rate))
-	}
-	
-	// Export to Prometheus with trace ID
-	currencyRateGauge.WithLabelValues(from, to).Set(rate)
-	
+
+	// Формируем ответ
 	response := CurrencyRate{
 		From: from,
 		To:   to,
 		Rate: rate,
 	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-	
-	slog.Info("Currency rate returned",
-		"from", from,
-		"to", to,
-		"rate", rate,
-		"trace_id", traceID,
-	)
-}
 
-// Health check handler with tracing
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	span := zipkin.SpanFromContext(ctx)
-	var traceID string
-	
-	if span != nil {
-		traceID = span.Context().TraceID.String()
-		span.Tag("handler", "health_check")
-	}
-	
-	healthStatus.Set(1)
-	
-	slog.Info("Health check requested", "trace_id", traceID)
-	
+	// Добавляем результат в span
+	span.SetAttributes(
+		attribute.Float64("currency.rate", rate),
+		attribute.Int("http.status_code", http.StatusOK),
+	)
+
+	// Записываем метрики
+	h.recordMetrics(ctx, start, http.StatusOK, from, to)
+
+	// Отправляем ответ
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":    "healthy",
-		"timestamp": time.Now().Format(time.RFC3339),
-		"trace_id":  traceID,
+	json.NewEncoder(w).Encode(response)
+}
+
+func (h *RateHandler) lookupRate(from, to string) (float64, bool) {
+	fromRates, ok := rates[from]
+	if !ok {
+		return 0, false
+	}
+	rate, ok := fromRates[to]
+	return rate, ok
+}
+
+func (h *RateHandler) handleError(ctx context.Context, w http.ResponseWriter, span trace.Span, start time.Time, from, to string, statusCode int, message string) {
+	span.SetAttributes(
+		attribute.Int("http.status_code", statusCode),
+		attribute.String("error.message", message),
+	)
+	span.RecordError(fmt.Errorf(message))
+
+	// Записываем метрики
+	h.recordMetrics(ctx, start, statusCode, from, to)
+
+	// Отправляем ответ
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(ErrorResponse{
+		Error:   http.StatusText(statusCode),
+		Code:    statusCode,
+		Message: message,
 	})
 }
 
-// Readiness probe with tracing
-func readyHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	span := zipkin.SpanFromContext(ctx)
-	var traceID string
-	
-	if span != nil {
-		traceID = span.Context().TraceID.String()
-		span.Tag("handler", "readiness_check")
+func (h *RateHandler) recordMetrics(ctx context.Context, start time.Time, statusCode int, from, to string) {
+	duration := time.Since(start).Seconds()
+	attrs := []attribute.KeyValue{
+		attribute.String("method", "GET"),
+		attribute.String("path", "/rate"),
+		attribute.Int("status", statusCode),
+		attribute.String("from", from),
+		attribute.String("to", to),
 	}
-	
-	slog.Info("Readiness check requested", "trace_id", traceID)
-	
+	requestCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+	requestLatency.Record(ctx, duration, metric.WithAttributes(attrs...))
+}
+
+// HealthHandler для проверки здоровья сервиса
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
-		"status":    "ready",
-		"timestamp": time.Now().Format(time.RFC3339),
-		"trace_id":  traceID,
+		"status": "healthy",
+		"time":   time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
 func main() {
-	// Настройка structured logging
-	logFile, err := os.OpenFile("logs/app.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	cfg := getConfig()
+	ctx := context.Background()
+
+	log.Printf("Starting %s v%s", cfg.ServiceName, cfg.ServiceVersion)
+	log.Printf("OTEL Endpoint: %s", cfg.OTELEndpoint)
+
+	// Инициализация ресурса
+	res, err := initResource(cfg)
 	if err != nil {
-		slog.Error("Failed to open log file", "error", err)
-		os.Exit(1)
+		log.Fatalf("Failed to create resource: %v", err)
 	}
-	defer logFile.Close()
-	
-	// Создаем multi-writer для логирования в файл и stdout
-	multiWriter := io.MultiWriter(os.Stdout, logFile)
-	logger := slog.New(slog.NewJSONHandler(multiWriter, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
-	
-	// Инициализируем Zipkin tracing
-	err = initTracing("muffin-currency", "http://localhost:9411/api/v2/spans")
+
+	// Инициализация трейсинга
+	tp, err := initTracerProvider(ctx, res, cfg)
 	if err != nil {
-		slog.Error("Failed to initialize Zipkin tracing", "error", err)
-		os.Exit(1)
+		log.Printf("Warning: Failed to initialize tracer provider: %v", err)
+		log.Println("Continuing without tracing...")
+	} else {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := tp.Shutdown(shutdownCtx); err != nil {
+				log.Printf("Error shutting down tracer provider: %v", err)
+			}
+		}()
 	}
-	
-	// Инициализируем health метрику
-	healthStatus.Set(1)
-	
-	// Настройка маршрутов
+
+	// Инициализация метрик
+	mp, err := initMeterProvider(ctx, res, cfg)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize meter provider: %v", err)
+		log.Println("Continuing without metrics...")
+	} else {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := mp.Shutdown(shutdownCtx); err != nil {
+				log.Printf("Error shutting down meter provider: %v", err)
+			}
+		}()
+	}
+
+	// Инициализация кастомных метрик
+	if err := initMetrics(cfg); err != nil {
+		log.Printf("Warning: Failed to initialize metrics: %v", err)
+	}
+
+	// Создаем tracer
+	tracer = otel.Tracer(cfg.ServiceName)
+
+	// Создаем роутер
 	mux := http.NewServeMux()
-	
-	// Business логика
-	mux.HandleFunc("/rate", getRateHandler)
-	
-	// Health checks
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/readyz", readyHandler)
-	
-	// Prometheus метрики
-	mux.Handle("/metrics", promhttp.Handler())
-	
-	// Apply middlewares in order: tracing -> metrics -> router
-	handler := tracingMiddleware(mux)
-	handler = metricsMiddleware(handler)
-	
-	// Конфигурируем порт
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	
+
+	// Регистрируем handlers с otelhttp middleware
+	rateHandler := NewRateHandler(tracer)
+	mux.Handle("/rate", otelhttp.NewHandler(rateHandler, "rate"))
+	mux.HandleFunc("/health", HealthHandler)
+
+	// Создаем сервер
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      handler,
+		Addr:         ":" + cfg.HTTPPort,
+		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	
+
 	// Graceful shutdown
 	go func() {
 		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
-		
-		logger.Info("Shutting down server...")
-		healthStatus.Set(0)
-		
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+		log.Println("Shutting down server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		
-		if err = server.Shutdown(ctx); err != nil {
-			logger.Error("Server forced to shutdown", "error", err)
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Error during server shutdown: %v", err)
 		}
 	}()
-	
-	logger.Info("Starting server", 
-		"port", port,
-		"zipkin_endpoint", "http://localhost:9411/api/v2/spans")
-	
-	if err = server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error("Server failed to start", "error", err)
-		os.Exit(1)
-	}
-}
 
-func ParseTraceparent(tp string) (model.SpanContext, error) {
-	// Формат: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-	if tp == "" {
-		return model.SpanContext{}, nil // Нет заголовка - создаем новый trace
-	}
-	
-	parts := strings.Split(tp, "-")
-	if len(parts) < 4 {
-		return model.SpanContext{}, fmt.Errorf("invalid traceparent format: %s", tp)
+	log.Printf("Server starting on port %s", cfg.HTTPPort)
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("Server error: %v", err)
 	}
 
-	// 1. Парсим TraceID (16 байт / 32 символа)
-	tIDBytes, err := hex.DecodeString(parts[1])
-	if err != nil || len(tIDBytes) != 16 {
-		return model.SpanContext{}, fmt.Errorf("invalid traceid: %s, error: %v", parts[1], err)
-	}
-
-	traceID := model.TraceID{
-		High: binary.BigEndian.Uint64(tIDBytes[:8]),
-		Low:  binary.BigEndian.Uint64(tIDBytes[8:]),
-	}
-
-	// 2. Парсим SpanID (8 байт / 16 символов)
-	sIDBytes, err := hex.DecodeString(parts[2])
-	if err != nil || len(sIDBytes) != 8 {
-		return model.SpanContext{}, fmt.Errorf("invalid spanid: %s, error: %v", parts[2], err)
-	}
-	spanID := model.ID(binary.BigEndian.Uint64(sIDBytes))
-
-	// 3. Парсим флаги (последний байт)
-	flagsBytes, err := hex.DecodeString(parts[3])
-	sampled := false
-	if err == nil && len(flagsBytes) > 0 {
-		// Бит 0 отвечает за сэмплирование
-		sampled = (flagsBytes[0] & 0x01) == 0x01
-	}
-
-	return model.SpanContext{
-		TraceID: traceID,
-		ID:      spanID,
-		Sampled: &sampled,
-	}, nil
+	log.Println("Server stopped")
 }
